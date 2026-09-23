@@ -11,6 +11,7 @@ from ckan.types import Context, ErrorDict
 import copy
 import logging
 import sys
+import time
 from typing import (
     Any, Container, Dict, Iterable, Optional, Set, Union,
     cast)
@@ -29,9 +30,15 @@ from urllib.parse import (
 )
 from io import StringIO
 import msgspec
+from redis.client import Pipeline
+from redis.exceptions import RedisError
+from rq import get_current_job
+from rq.job import JobStatus
+from rq.registry import ScheduledJobRegistry
 
 import ckan.plugins as p
 import ckan.plugins.toolkit as toolkit
+from ckan.lib import jobs
 from ckan.lib.lazyjson import LazyJSONObject
 
 import ckanext.datastore.helpers as datastore_helpers
@@ -59,12 +66,14 @@ _engines: Dict[str, Engine] = {}
 WhereClauses: TypeAlias = "list[tuple[str, dict[str, Any]] | tuple[str]]"
 
 _TIMEOUT = 60000  # milliseconds
+_VACUUM_SETTLE_TIME = datetime.timedelta(seconds=10)
 
 # See http://www.postgresql.org/docs/9.2/static/errcodes-appendix.html
 _PG_ERR_CODE = {
     'unique_violation': '23505',
     'query_canceled': '57014',
     'undefined_object': '42704',
+    'undefined_table': '42P01',
     'syntax_error': '42601',
     'permission_denied': '42501',
     'duplicate_table': '42P07',
@@ -1705,7 +1714,7 @@ def format_results(context: Context, results: Any, data_dict: dict[str, Any]):
     return _unrename_json_field(data_dict)
 
 
-def delete_data(context: Context, data_dict: dict[str, Any]):
+def delete_data(context: Context, data_dict: dict[str, Any]) -> int:
     validate(context, data_dict)
     fields_types = _get_fields_types(
         context['connection'], data_dict['resource_id'])
@@ -1725,9 +1734,88 @@ def delete_data(context: Context, data_dict: dict[str, Any]):
     )
 
     try:
-        _execute_single_statement(context, sql_string, where_values)
+        result = _execute_single_statement(context, sql_string, where_values)
     except ProgrammingError as pe:
         raise ValidationError({'filters': [_programming_error_summary(pe)]})
+    return result.rowcount
+
+
+def _schedule_vacuum(resource_id: str) -> None:
+    """Atomically replace the pending VACUUM after a record deletion."""
+    queue = jobs.get_queue()
+    key = f'{config["ckan.site_id"]}-{resource_id}-datastore-vacuum'
+
+    def schedule(pipe: Pipeline) -> None:
+        previous_id = pipe.get(key)
+        previous = queue.fetch_job(previous_id.decode()) if previous_id else None
+        pipe.multi()
+        if previous is not None:
+            previous.delete(pipeline=pipe)
+        # A new ID prevents a scheduler holding the old job from consuming
+        # the replacement schedule. The worker also checks ownership below.
+        job = queue.create_job(
+            _vacuum, args=(resource_id,), status=JobStatus.SCHEDULED,
+            timeout=config['ckan.jobs.timeout'],
+        )
+        pipe.sadd(queue.redis_queues_keys, queue.key)
+        job.save(pipeline=pipe)
+        # RQ 1.x ignores the pipeline argument when scheduling. Bind the
+        # registry to the pipeline so the schedule is in this transaction.
+        registry = ScheduledJobRegistry(queue.name, connection=pipe)
+        registry.schedule(
+            job, datetime.datetime.now(datetime.timezone.utc)
+            + _VACUUM_SETTLE_TIME,
+        )
+        pipe.set(key, job.id)
+
+    queue.connection.transaction(schedule, key)
+    log.info(
+        'Scheduled VACUUM for resource %s with a %.0f second cooldown',
+        resource_id, _VACUUM_SETTLE_TIME.total_seconds(),
+    )
+
+
+def _vacuum(resource_id: str) -> None:
+    """Skip superseded jobs and VACUUM outside a database transaction."""
+    job = get_current_job()
+    assert job is not None
+    key = f'{config["ckan.site_id"]}-{resource_id}-datastore-vacuum'
+
+    def claim(pipe: Pipeline) -> bool:
+        if pipe.get(key) != job.id.encode():
+            return False
+        pipe.multi()
+        pipe.delete(key)
+        return True
+
+    if not job.connection.transaction(claim, key, value_from_callable=True):
+        log.info('Skipping superseded VACUUM for resource %s', resource_id)
+        return
+
+    started = time.monotonic()
+    log.info('Starting VACUUM for resource %s', resource_id)
+    try:
+        with get_write_engine().connect() as conn:
+            conn = conn.execution_options(isolation_level='AUTOCOMMIT')
+            conn.execute(sa.text(f'VACUUM {identifier(resource_id)}'))
+    except Exception as e:
+        # The table may have been dropped while this job was pending.
+        if (isinstance(e, ProgrammingError)
+                and e.orig.pgcode == _PG_ERR_CODE['undefined_table']):
+            log.info(
+                'Skipping VACUUM for resource %s: table no longer exists',
+                resource_id,
+            )
+            return
+        log.exception(
+            'VACUUM failed for resource %s after %.2f seconds',
+            resource_id, time.monotonic() - started,
+        )
+        raise
+    log.info(
+        'VACUUM completed for resource %s in %.2f seconds',
+        resource_id, time.monotonic() - started,
+    )
 
 
 def _create_triggers(connection: Any, resource_id: str,
@@ -2176,6 +2264,7 @@ class DatastorePostgresqlBackend(DatastoreBackend):
         engine = self._get_write_engine()
         _cache_types(engine)
 
+        deleted_count = 0
         with engine.begin() as conn:
             context["connection"] = conn
             # check if table exists
@@ -2184,9 +2273,18 @@ class DatastorePostgresqlBackend(DatastoreBackend):
                     identifier(data_dict['resource_id'])
                 )))
             else:
-                delete_data(context, data_dict)
+                deleted_count = delete_data(context, data_dict)
 
-            return _unrename_json_field(data_dict)
+        if deleted_count > 0:
+            try:
+                _schedule_vacuum(data_dict['resource_id'])
+            except RedisError:
+                log.exception(
+                    'Could not schedule VACUUM for resource %s after deletion',
+                    data_dict['resource_id'],
+                )
+
+        return _unrename_json_field(data_dict)
 
     def create(
             self,
