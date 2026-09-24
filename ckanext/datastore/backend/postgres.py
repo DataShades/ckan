@@ -30,11 +30,6 @@ from urllib.parse import (
 )
 from io import StringIO
 import msgspec
-from redis.client import Pipeline
-from redis.exceptions import RedisError
-from rq import get_current_job
-from rq.job import JobStatus
-from rq.registry import ScheduledJobRegistry
 
 import ckan.plugins as p
 import ckan.plugins.toolkit as toolkit
@@ -1741,34 +1736,17 @@ def delete_data(context: Context, data_dict: dict[str, Any]) -> int:
 
 
 def _schedule_vacuum(resource_id: str) -> None:
-    """Atomically replace the pending VACUUM after a record deletion."""
-    queue = jobs.get_queue()
-    key = f'{config["ckan.site_id"]}-{resource_id}-datastore-vacuum'
+    """Reschedule VACUUM after the last record deletion."""
+    job_id = f'{config["ckan.site_id"]}-{resource_id}-datastore-vacuum'
+    try:
+        jobs.job_from_id(job_id).delete()
+    except KeyError:
+        pass
 
-    def schedule(pipe: Pipeline) -> None:
-        previous_id = pipe.get(key)
-        previous = queue.fetch_job(previous_id.decode()) if previous_id else None
-        pipe.multi()
-        if previous is not None:
-            previous.delete(pipeline=pipe)
-        # A new ID prevents a scheduler holding the old job from consuming
-        # the replacement schedule. The worker also checks ownership below.
-        job = queue.create_job(
-            _vacuum, args=(resource_id,), status=JobStatus.SCHEDULED,
-            timeout=config['ckan.jobs.timeout'],
-        )
-        pipe.sadd(queue.redis_queues_keys, queue.key)
-        job.save(pipeline=pipe)
-        # RQ 1.x ignores the pipeline argument when scheduling. Bind the
-        # registry to the pipeline so the schedule is in this transaction.
-        registry = ScheduledJobRegistry(queue.name, connection=pipe)
-        registry.schedule(
-            job, datetime.datetime.now(datetime.timezone.utc)
-            + _VACUUM_SETTLE_TIME,
-        )
-        pipe.set(key, job.id)
-
-    queue.connection.transaction(schedule, key)
+    jobs.get_queue().enqueue_in(
+        _VACUUM_SETTLE_TIME, _vacuum, resource_id,
+        job_id=job_id, job_timeout=config['ckan.jobs.timeout'],
+    )
     log.info(
         'Scheduled VACUUM for resource %s with a %.0f second cooldown',
         resource_id, _VACUUM_SETTLE_TIME.total_seconds(),
@@ -1776,22 +1754,7 @@ def _schedule_vacuum(resource_id: str) -> None:
 
 
 def _vacuum(resource_id: str) -> None:
-    """Skip superseded jobs and VACUUM outside a database transaction."""
-    job = get_current_job()
-    assert job is not None
-    key = f'{config["ckan.site_id"]}-{resource_id}-datastore-vacuum'
-
-    def claim(pipe: Pipeline) -> bool:
-        if pipe.get(key) != job.id.encode():
-            return False
-        pipe.multi()
-        pipe.delete(key)
-        return True
-
-    if not job.connection.transaction(claim, key, value_from_callable=True):
-        log.info('Skipping superseded VACUUM for resource %s', resource_id)
-        return
-
+    """VACUUM outside a database transaction."""
     started = time.monotonic()
     log.info('Starting VACUUM for resource %s', resource_id)
     try:
@@ -2278,7 +2241,8 @@ class DatastorePostgresqlBackend(DatastoreBackend):
         if deleted_count > 0:
             try:
                 _schedule_vacuum(data_dict['resource_id'])
-            except RedisError:
+            except Exception:
+                # Deletion is already committed; scheduling must not fail it.
                 log.exception(
                     'Could not schedule VACUUM for resource %s after deletion',
                     data_dict['resource_id'],
