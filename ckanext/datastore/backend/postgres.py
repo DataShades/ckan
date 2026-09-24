@@ -11,6 +11,7 @@ from ckan.types import Context, ErrorDict
 import copy
 import logging
 import sys
+import time
 from typing import (
     Any, Container, Dict, Iterable, Optional, Set, Union,
     cast)
@@ -32,6 +33,7 @@ import msgspec
 
 import ckan.plugins as p
 import ckan.plugins.toolkit as toolkit
+from ckan.lib import jobs
 from ckan.lib.lazyjson import LazyJSONObject
 
 import ckanext.datastore.helpers as datastore_helpers
@@ -59,12 +61,14 @@ _engines: Dict[str, Engine] = {}
 WhereClauses: TypeAlias = "list[tuple[str, dict[str, Any]] | tuple[str]]"
 
 _TIMEOUT = 60000  # milliseconds
+_VACUUM_SETTLE_TIME = datetime.timedelta(seconds=10)
 
 # See http://www.postgresql.org/docs/9.2/static/errcodes-appendix.html
 _PG_ERR_CODE = {
     'unique_violation': '23505',
     'query_canceled': '57014',
     'undefined_object': '42704',
+    'undefined_table': '42P01',
     'syntax_error': '42601',
     'permission_denied': '42501',
     'duplicate_table': '42P07',
@@ -1705,7 +1709,7 @@ def format_results(context: Context, results: Any, data_dict: dict[str, Any]):
     return _unrename_json_field(data_dict)
 
 
-def delete_data(context: Context, data_dict: dict[str, Any]):
+def delete_data(context: Context, data_dict: dict[str, Any]) -> int:
     validate(context, data_dict)
     fields_types = _get_fields_types(
         context['connection'], data_dict['resource_id'])
@@ -1725,9 +1729,56 @@ def delete_data(context: Context, data_dict: dict[str, Any]):
     )
 
     try:
-        _execute_single_statement(context, sql_string, where_values)
+        result = _execute_single_statement(context, sql_string, where_values)
     except ProgrammingError as pe:
         raise ValidationError({'filters': [_programming_error_summary(pe)]})
+    return result.rowcount
+
+
+def _schedule_vacuum(resource_id: str) -> None:
+    """Reschedule VACUUM after the last record deletion."""
+    job_id = f'{config["ckan.site_id"]}-{resource_id}-datastore-vacuum'
+    try:
+        jobs.job_from_id(job_id).delete()
+    except KeyError:
+        pass
+
+    jobs.get_queue().enqueue_in(
+        _VACUUM_SETTLE_TIME, _vacuum, resource_id,
+        job_id=job_id, job_timeout=config['ckan.jobs.timeout'],
+    )
+    log.info(
+        'Scheduled VACUUM for resource %s with a %.0f second cooldown',
+        resource_id, _VACUUM_SETTLE_TIME.total_seconds(),
+    )
+
+
+def _vacuum(resource_id: str) -> None:
+    """VACUUM outside a database transaction."""
+    started = time.monotonic()
+    log.info('Starting VACUUM for resource %s', resource_id)
+    try:
+        with get_write_engine().connect() as conn:
+            conn = conn.execution_options(isolation_level='AUTOCOMMIT')
+            conn.execute(sa.text(f'VACUUM {identifier(resource_id)}'))
+    except Exception as e:
+        # The table may have been dropped while this job was pending.
+        if (isinstance(e, ProgrammingError)
+                and e.orig.pgcode == _PG_ERR_CODE['undefined_table']):
+            log.info(
+                'Skipping VACUUM for resource %s: table no longer exists',
+                resource_id,
+            )
+            return
+        log.exception(
+            'VACUUM failed for resource %s after %.2f seconds',
+            resource_id, time.monotonic() - started,
+        )
+        raise
+    log.info(
+        'VACUUM completed for resource %s in %.2f seconds',
+        resource_id, time.monotonic() - started,
+    )
 
 
 def _create_triggers(connection: Any, resource_id: str,
@@ -2176,6 +2227,7 @@ class DatastorePostgresqlBackend(DatastoreBackend):
         engine = self._get_write_engine()
         _cache_types(engine)
 
+        deleted_count = 0
         with engine.begin() as conn:
             context["connection"] = conn
             # check if table exists
@@ -2184,9 +2236,19 @@ class DatastorePostgresqlBackend(DatastoreBackend):
                     identifier(data_dict['resource_id'])
                 )))
             else:
-                delete_data(context, data_dict)
+                deleted_count = delete_data(context, data_dict)
 
-            return _unrename_json_field(data_dict)
+        if deleted_count > 0:
+            try:
+                _schedule_vacuum(data_dict['resource_id'])
+            except Exception:
+                # Deletion is already committed; scheduling must not fail it.
+                log.exception(
+                    'Could not schedule VACUUM for resource %s after deletion',
+                    data_dict['resource_id'],
+                )
+
+        return _unrename_json_field(data_dict)
 
     def create(
             self,
