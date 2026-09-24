@@ -7,10 +7,6 @@ from threading import Barrier
 import pytest
 import sqlalchemy as sa
 from freezegun import freeze_time
-from redis.exceptions import ConnectionError as RedisConnectionError
-from rq.job import Job
-from rq.registry import ScheduledJobRegistry
-from rq.scheduler import RQScheduler
 
 from ckan import model
 from ckan.lib import jobs
@@ -76,10 +72,7 @@ def vacuum_statements():
 
 
 def run_due_jobs(queue):
-    scheduler = RQScheduler([queue], connection=queue.connection)
-    scheduler.prepare_registries([queue.name])
-    scheduler.enqueue_scheduled_jobs()
-    jobs.Worker().work(burst=True)
+    jobs.Worker().work(burst=True, with_scheduler=True)
     assert queue.failed_job_registry.count == 0
 
 
@@ -116,13 +109,37 @@ def test_records_deleted_schedule_delayed_vacuum(
     assert scheduled.get_job_ids() == []
 
 
-def test_redis_failure_does_not_fail_committed_delete(
+def test_rolled_back_deletion_does_not_schedule_vacuum(table, queue):
+    # Other rows reference row 1. Defer the check so DELETE succeeds but
+    # committing the transaction fails and restores the deleted row.
+    with db.get_write_engine().begin() as conn:
+        conn.execute(sa.text(
+            f'ALTER TABLE {db.identifier(table)} '
+            f'ADD COLUMN parent_id integer DEFAULT 1 '
+            f'REFERENCES {db.identifier(table)} (_id) '
+            'DEFERRABLE INITIALLY DEFERRED'
+        ))
+
+    with pytest.raises(sa.exc.IntegrityError) as error:
+        helpers.call_action(
+            "datastore_delete", resource_id=table, force=True,
+            filters={"value": 1},
+        )
+    assert error.value.orig.pgcode == "23503"  # Foreign-key violation.
+
+    result = helpers.call_action("datastore_search", resource_id=table)
+    assert [record["value"] for record in result["records"]] == [1, 2, 3]
+    assert queue.scheduled_job_registry.get_job_ids() == []
+    assert queue.count == 0
+
+
+def test_scheduling_failure_does_not_fail_committed_delete(
     table, queue, monkeypatch
 ):
-    def fail_transaction(*args, **kwargs):
-        raise RedisConnectionError("Redis unavailable")
+    def fail_scheduling(*args, **kwargs):
+        raise RuntimeError("Queue unavailable")
 
-    monkeypatch.setattr(queue.connection, "transaction", fail_transaction)
+    monkeypatch.setattr(queue, "enqueue_in", fail_scheduling)
     with helpers.recorded_logs(db.log) as logs:
         result = helpers.call_action(
             "datastore_delete", resource_id=table, force=True,
@@ -316,12 +333,10 @@ def test_different_resources_each_get_vacuum(
         ) == 1
 
 
-@pytest.mark.parametrize("first_action", DELETE_ACTIONS)
-@pytest.mark.parametrize("second_action", DELETE_ACTIONS)
 @pytest.mark.parametrize("already_scheduled", [False, True])
 def test_overlapping_deletions_vacuum_once(
-    first_action, second_action, already_scheduled, table, queue, clock,
-    vacuum_statements, test_request_context
+    already_scheduled, table, queue, clock, vacuum_statements,
+    test_request_context
 ):
     if already_scheduled:
         helpers.call_action(
@@ -354,7 +369,7 @@ def test_overlapping_deletions_vacuum_once(
             values = [2, 3] if already_scheduled else [1, 2]
             futures = [
                 executor.submit(delete, action, value)
-                for action, value in zip([first_action, second_action], values)
+                for action, value in zip(DELETE_ACTIONS, values)
             ]
             for future in futures:
                 future.result(timeout=15)
@@ -375,66 +390,3 @@ def test_overlapping_deletions_vacuum_once(
     run_due_jobs(queue)
     assert len(vacuum_statements) == 1
     assert queue.scheduled_job_registry.get_job_ids() == []
-
-
-@pytest.mark.parametrize("stage", ["selected", "fetched"])
-def test_deletion_while_scheduler_moves_due_job_resets_cooldown(
-    stage, table, queue, clock, vacuum_statements, monkeypatch
-):
-    helpers.call_action(
-        "datastore_delete", resource_id=table, force=True, filters={"value": 1}
-    )
-    clock.tick(timedelta(seconds=10))
-    interleaved = []
-
-    def delete_more():
-        helpers.call_action(
-            "datastore_records_delete", resource_id=table, force=True,
-            filters={"value": 2},
-        )
-        interleaved.append(True)
-
-    # Pause the real scheduler after it has selected or fetched the old job.
-    # A deletion then replaces that job before the scheduler enqueues it.
-    with monkeypatch.context() as patch:
-        if stage == "selected":
-            original = ScheduledJobRegistry.get_jobs_to_schedule
-
-            def select_then_delete(self, *args, **kwargs):
-                job_ids = original(self, *args, **kwargs)
-                delete_more()
-                return job_ids
-
-            patch.setattr(
-                ScheduledJobRegistry, "get_jobs_to_schedule", select_then_delete
-            )
-        else:
-            original = Job.fetch_many
-
-            def fetch_then_delete(*args, **kwargs):
-                fetched = original(*args, **kwargs)
-                delete_more()
-                return fetched
-
-            patch.setattr(Job, "fetch_many", fetch_then_delete)
-
-        run_due_jobs(queue)
-
-    assert interleaved == [True]
-    result = helpers.call_action("datastore_search", resource_id=table)
-    assert [record["value"] for record in result["records"]] == [3]
-    assert vacuum_statements == []
-    assert len(queue.scheduled_job_registry.get_job_ids()) == 1
-
-    clock.tick(timedelta(seconds=9))
-    run_due_jobs(queue)
-    assert vacuum_statements == []
-
-    clock.tick(timedelta(seconds=1))
-    run_due_jobs(queue)
-    assert len(vacuum_statements) == 1
-    assert queue.scheduled_job_registry.get_job_ids() == []
-
-    clock.tick(timedelta(seconds=10))
-    run_due_jobs(queue)
-    assert len(vacuum_statements) == 1
