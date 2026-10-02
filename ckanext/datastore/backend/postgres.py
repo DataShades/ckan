@@ -1743,7 +1743,9 @@ def _schedule_vacuum(resource_id: str) -> None:
     except KeyError:
         pass
 
-    jobs.get_queue().enqueue_in(
+    jobs.get_queue(
+        config.get('ckan.datastore.vacuum_queue', 'default')
+    ).enqueue_in(
         _VACUUM_SETTLE_TIME, _vacuum, resource_id,
         job_id=job_id, job_timeout=config['ckan.jobs.timeout'],
     )
