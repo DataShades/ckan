@@ -22,6 +22,13 @@ groups:
       the same used in :ref:`ckan.datastore.write_url`, but the user should be one
       with read permissions only. The format is the same as in :ref:`sqlalchemy.url`.
 
+  - key: ckan.datastore.vacuum_queue
+    default: default
+    example: datastore-vacuum
+    description: |
+      The background job queue used for DataStore VACUUM after record deletions.
+      Defaults to ``default``.
+
   - key: ckan.datastore.sqlsearch.allowed_functions_file
     default_callable: ckanext.datastore.plugin:sql_functions_allowlist_file
     example: /path/to/my_allowed_functions.txt
