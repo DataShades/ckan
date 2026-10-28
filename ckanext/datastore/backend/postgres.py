@@ -1775,7 +1775,7 @@ def delete_data(context: Context, data_dict: dict[str, Any]) -> int:
 
 def _schedule_vacuum(resource_id: str) -> None:
     """Reschedule VACUUM after the last record deletion."""
-    job_id = f'{config["ckan.site_id"]}-{resource_id}-datastore-vacuum'
+    job_id = f'{resource_id}_datastore-vacuum'
     try:
         jobs.job_from_id(job_id).delete()
     except KeyError:

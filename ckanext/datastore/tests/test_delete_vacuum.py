@@ -13,6 +13,7 @@ from ckan.lib import jobs
 from ckan.plugins.toolkit import ObjectNotFound
 from ckan.tests import factories, helpers
 from ckanext.datastore.backend import postgres as db
+from ckanext.datastore.logic import action as datastore_action
 
 
 pytestmark = [
@@ -35,6 +36,14 @@ def create_table():
         records=[{"value": 1}, {"value": 2}, {"value": 3}],
     )
     return resource["id"]
+
+
+@pytest.fixture(autouse=True)
+def no_record_count_jobs(monkeypatch):
+    """Keep the scheduled job registry limited to VACUUM jobs."""
+    monkeypatch.setattr(
+        datastore_action, "_schedule_calculate_record_count", lambda resource_id: None
+    )
 
 
 @pytest.fixture
