@@ -77,7 +77,6 @@ _PG_ERR_CODE = {
     'permission_denied': '42501',
     'duplicate_table': '42P07',
     'duplicate_alias': '42712',
-    'undefined_table': '42P01',
 }
 
 _DATE_FORMATS = ['%Y-%m-%d',
