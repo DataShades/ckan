@@ -349,9 +349,9 @@ def _update_facet_titles(
         facets: 'OrderedDict[str, str]',
         group_type: str) -> 'OrderedDict[str, str]':
     if g.group_dict.get(u'is_organization'):
-        del facets['organization']
+        facets.pop('organization', None)
     else:
-        del facets['groups']
+        facets.pop('groups', None)
     for plugin in plugins.PluginImplementations(plugins.IFacets):
         facets = (
             plugin.group_facets(facets, group_type, None)
